@@ -54,7 +54,7 @@ To set up this project, clone the repository and install the necessary dependenc
 git clone https://github.com/nowitsanurag/Stock-Analysis-Project.git
 cd Stock-Analysis-Project
 pip install -r requirements.txt
-
+```
 
 
 ### Key Enhancements:
