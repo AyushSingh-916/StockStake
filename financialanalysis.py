@@ -1,4 +1,4 @@
-# !pip install plotly
+!pip install plotly yfinance scikit-learn pandas numpy
 
 import yfinance as yf
 import pandas as pd
@@ -11,180 +11,199 @@ import datetime
 import plotly.graph_objs as go
 from plotly.offline import iplot
 
-
 # -----------------------------
-# Data Collection
+# 1. Data Collection
 # -----------------------------
-def load_stock_data(symbol):
-    """Download historical stock data for a given symbol."""
+def load_stock_data(symbol, years=2):
+    """Download historical stock data. Defaults to 2 years as per resume."""
     try:
-        today = datetime.datetime.now().strftime('%Y-%m-%d')
-        df = yf.download(symbol, start="2010-01-01", end=today)
+        end_date = datetime.datetime.now()
+        start_date = end_date - datetime.timedelta(days=years*365)
+        
+        df = yf.download(symbol, start=start_date.strftime('%Y-%m-%d'), end=end_date.strftime('%Y-%m-%d'), progress=False)
         stock_info = yf.Ticker(symbol)
         return df, stock_info
     except Exception as err:
         print(f"Could not retrieve data for {symbol}: {err}")
         return None, None
 
+# -----------------------------
+# 2. Fundamental Ratios (Fixed Extraction)
+# -----------------------------
+def safe_extract(df, keys):
+    if df is None or df.empty: return np.nan
+    for key in keys:
+        if key in df.index: return df.loc[key].iloc 
+    return np.nan
 
-# -----------------------------
-# Financial Ratios Calculation
-# -----------------------------
 def extract_financial_ratios(stock_info):
-    """Compute key financial ratios using Yahoo Finance data."""
+    """Compute key financial ratios for holistic insights."""
     metrics = {}
     try:
-        info = stock_info.info
         bs = stock_info.balance_sheet
-        cf = stock_info.cashflow
         fs = stock_info.financials
 
-        # Valuation
-        metrics['pe_ratio'] = info.get('trailingPE', np.nan)
+        debt = safe_extract(bs, ['Total Debt', 'Total Liab', 'Total Liabilities Net Minority Interest'])
+        equity = safe_extract(bs, ['Stockholders Equity', 'Total Stockholder Equity'])
+        metrics['de_ratio'] = debt / equity if equity and equity != 0 else np.nan
 
-        # Leverage
-        debt = bs.get('Total Liab', pd.Series([np.nan])).iloc[-1]
-        equity = bs.get('Total Stockholder Equity', pd.Series([np.nan])).iloc[-1]
-        metrics['de_ratio'] = debt / equity if equity else np.nan
-
-        # Profitability
-        net_income = fs.get('Net Income', pd.Series([np.nan])).iloc[-1]
-        metrics['roe'] = net_income / equity if equity else np.nan
-
-        # Liquidity
-        current_assets = bs.get('Total Current Assets', pd.Series([np.nan])).iloc[-1]
-        current_liabilities = bs.get('Total Current Liabilities', pd.Series([np.nan])).iloc[-1]
-        metrics['current_ratio'] = current_assets / current_liabilities if current_liabilities else np.nan
-
-        # Dividend
-        metrics['dividend_yield'] = info.get('dividendYield', np.nan)
-
-        # Interest coverage
-        operating_cash = cf.get('Total Cash From Operating Activities', pd.Series([np.nan])).iloc[-1]
-        interest = cf.get('Interest Expense', pd.Series([0])).iloc[-1]
-        metrics['interest_coverage'] = operating_cash / -interest if interest else np.nan
-
-        # Efficiency
-        revenue = fs.get('Total Revenue', pd.Series([np.nan])).iloc[-1]
-        avg_assets = (bs.get('Total Assets', pd.Series([np.nan])).iloc[-1] + bs.get('Total Assets', pd.Series([np.nan])).iloc[0]) / 2
-        metrics['asset_turnover'] = revenue / avg_assets if avg_assets else np.nan
+        net_income = safe_extract(fs, ['Net Income Common Stockholders', 'Net Income'])
+        metrics['roe'] = net_income / equity if equity and equity != 0 else np.nan
+        
+        current_assets = safe_extract(bs, ['Current Assets', 'Total Current Assets'])
+        current_liabilities = safe_extract(bs, ['Current Liabilities', 'Total Current Liabilities'])
+        metrics['current_ratio'] = current_assets / current_liabilities if current_liabilities and current_liabilities != 0 else np.nan
 
     except Exception as err:
-        print(f"Error computing ratios: {err}")
-
+        pass # Silently pass missing data to keep output clean
     return metrics
 
-
 # -----------------------------
-# Model Training & Evaluation
+# 3. Feature Engineering (The Secret Sauce)
 # -----------------------------
-def train_price_model(df):
-    """Train a Random Forest model to predict stock prices."""
-    if df is None or df.empty:
-        return None, None, None, float('nan')
-
-    df['Index_Day'] = np.arange(len(df))
-    features = df[['Index_Day']]
-    target = df['Close']
-
-    X_train, X_test, y_train, y_test = train_test_split(features, target, test_size=0.2, random_state=0)
-
-    rf_model = RandomForestRegressor(n_estimators=100, random_state=42)
-    rf_model.fit(X_train, y_train)
-
-    test_rmse = sqrt(mean_squared_error(y_test, rf_model.predict(X_test)))
-    return rf_model, features, target, test_rmse
-
-
-# -----------------------------
-# Visualization
-# -----------------------------
-def plot_historical_vs_predicted(df, model, features, target):
-    """Visualize actual vs predicted stock prices."""
-    actual_trace = go.Scatter(x=df.index, y=df['Close'], mode='lines', name='Actual')
-    predicted_trace = go.Scatter(x=features.index, y=model.predict(features), mode='markers', name='Predicted', marker=dict(color='red'))
+def create_lagged_features(df, lags=5):
+    """Convert prices to daily returns and create sliding window features."""
+    data = pd.DataFrame(index=df.index)
+    data['Close'] = df['Close'].values.flatten()
     
-    layout = go.Layout(title='Stock Price Estimation', xaxis=dict(title='Date'), yaxis=dict(title='Price'))
-    fig = go.Figure(data=[actual_trace, predicted_trace], layout=layout)
+    # We predict Daily Returns (percentage change), not raw prices
+    data['Return'] = data['Close'].pct_change()
+    
+    # Create Lagged Returns (sliding window)
+    for i in range(1, lags + 1):
+        data[f'Lag_{i}'] = data['Return'].shift(i)
+        
+    data.dropna(inplace=True)
+    return data
+
+# -----------------------------
+# 4. Model Training (Random Forest)
+# -----------------------------
+def train_rf_model(data, lags=5):
+    """Train Random Forest on lagged returns."""
+    features = [f'Lag_{i}' for i in range(1, lags + 1)]
+    X = data[features]
+    y = data['Return']
+
+    X_train, X_test, y_train, y_test = train_test_split(X, y, test_size=0.2, shuffle=False)
+
+    model = RandomForestRegressor(n_estimators=100, max_depth=10, random_state=42)
+    model.fit(X_train, y_train)
+
+    # Calculate RMSE on the Test Set (Returns)
+    predictions = model.predict(X_test)
+    test_rmse = sqrt(mean_squared_error(y_test, predictions))
+    
+    # Predict over the entire dataset for visualization
+    data['Predicted_Return'] = model.predict(X)
+    
+    # Reconstruct prices from predicted returns
+    # Price_today = Price_yesterday * (1 + Predicted_Return)
+    data['Predicted_Close'] = data['Close'].shift(1) * (1 + data['Predicted_Return'])
+    
+    return model, data, test_rmse, features
+
+# -----------------------------
+# 5. Future Forecasting (Recursive)
+# -----------------------------
+def project_future_prices(model, data, features, days_ahead=30):
+    """Recursively forecast future returns and convert to prices."""
+    # Get the last known lagged returns as our starting window
+    current_window = data[features].iloc[-1].values.tolist()
+    last_known_price = data['Close'].iloc[-1]
+    
+    forecast_dates = pd.date_range(start=data.index[-1] + pd.Timedelta(days=1), periods=days_ahead, freq='B')
+    future_prices = []
+    
+    current_price = last_known_price
+    
+    for _ in range(days_ahead):
+        # Predict the return for the next day
+        pred_return = model.predict(np.array([current_window]))
+        
+        # Calculate new price
+        next_price = current_price * (1 + pred_return)
+        future_prices.append(next_price)
+        
+        # Update the sliding window for the next loop iteration
+        current_window.insert(0, pred_return)
+        current_window.pop() # Drop the oldest lag
+        
+        current_price = next_price
+        
+    return forecast_dates, future_prices
+
+# -----------------------------
+# 6. Plotly Visualizations
+# -----------------------------
+def plot_full_analysis(data, forecast_dates, future_prices, symbol):
+    """Combines historical, predicted, and future forecasts into one interactive chart."""
+    actual_trace = go.Scatter(x=data.index, y=data['Close'], mode='lines', name='Actual Price', line=dict(color='blue'))
+    
+    # Start predicted trace from the second day to align with shifted prices
+    pred_trace = go.Scatter(x=data.index[1:], y=data['Predicted_Close'][1:], mode='lines', name='RF Fitted', line=dict(color='orange', width=1))
+    
+    future_trace = go.Scatter(x=forecast_dates, y=future_prices, mode='lines', name='30-Day Forecast', line=dict(color='red', dash='dash'))
+    
+    layout = go.Layout(
+        title=f'{symbol} - AI Price Prediction & Forecast (Random Forest)',
+        xaxis=dict(title='Date'),
+        yaxis=dict(title='Stock Price'),
+        hovermode='x unified'
+    )
+    fig = go.Figure(data=[actual_trace, pred_trace, future_trace], layout=layout)
     iplot(fig)
 
-
-def project_future_prices(model, df, days_ahead=30):
-    """Forecast future prices based on trained model."""
-    if model is None or df.empty:
-        print("Forecasting not possible due to missing model/data.")
-        return None, None
-
-    last_index = df['Index_Day'].iloc[-1]
-    upcoming_days = np.arange(last_index + 1, last_index + days_ahead + 1)
-    forecast_dates = pd.date_range(start=df.index[-1] + pd.Timedelta(days=1), periods=days_ahead)
-    forecast_input = pd.DataFrame(upcoming_days, columns=['Index_Day'], index=forecast_dates)
-
-    future_predictions = model.predict(forecast_input)
-    return forecast_input.index, future_predictions
-
-
-def plot_future_forecast(df, forecast_dates, forecast_prices):
-    """Plot historical prices with forecasted future values."""
-    hist_trace = go.Scatter(x=df.index, y=df['Close'], mode='lines', name='Historical')
-    future_trace = go.Scatter(x=forecast_dates, y=forecast_prices, mode='lines', name='Forecast', line=dict(color='red', dash='dash'))
+# -----------------------------
+# 7. Recommendation Engine
+# -----------------------------
+def make_investment_decision(ratios, data, future_prices, rmse):
+    """Blends ML trajectory with Fundamental Ratios to reduce risk."""
+    clean_ratios = [val for val in ratios.values() if not np.isnan(val)]
+    fundamental_score = np.mean([np.tanh(val) for val in clean_ratios]) if clean_ratios else 0
     
-    layout = go.Layout(title='Future Stock Price Forecast', xaxis=dict(title='Date'), yaxis=dict(title='Price'))
-    fig = go.Figure(data=[hist_trace, future_trace], layout=layout)
-    iplot(fig)
-
-
-# -----------------------------
-# Recommendation Logic
-# -----------------------------
-def make_investment_decision(ratios, model, rmse):
-    """Provide buy/sell recommendation based on model & ratios."""
-    if model is None:
-        return "Recommendation unavailable: insufficient data."
-
-    ratio_score = np.nanmean([np.tanh(val) for val in ratios.values()])
-    confidence_level = 100 * np.tanh(model.feature_importances_[0]) * ratio_score if not np.isnan(ratio_score) else 50
-
-    decision = "Buy" if confidence_level > 50 else "Sell"
-    return f"Suggested Action: {decision} with {confidence_level:.2f}% confidence. Model RMSE: {rmse:.2f}"
-
+    # ML Score based on projected 30-day trajectory
+    current_price = data['Close'].iloc[-1]
+    projected_price = future_prices[-1]
+    expected_return = (projected_price - current_price) / current_price
+    
+    # Combine signals
+    confidence = min(100, max(50, 50 + (fundamental_score * 25) + (expected_return * 500)))
+    
+    decision = "BUY" if expected_return > 0.02 and fundamental_score > -0.2 else "SELL/HOLD"
+    
+    return f"Recommendation: {decision} | Confidence: {confidence:.1f}% | Proj. 30-Day Return: {expected_return*100:.2f}% | Model RMSE (Returns): {rmse:.4f}"
 
 # -----------------------------
-# Main Pipeline
+# 8. Main Execution Pipeline
 # -----------------------------
 def analyze_stock(symbol):
+    print(f"\nEvaluating {symbol}...")
     df, stock_info = load_stock_data(symbol)
 
     if df is not None and not df.empty:
         ratios = extract_financial_ratios(stock_info)
-        model, features, target, rmse = train_price_model(df)
-
-        plot_historical_vs_predicted(df, model, features, target)
-        recommendation = make_investment_decision(ratios, model, rmse)
-
-        forecast_dates, forecast_prices = project_future_prices(model, df, days_ahead=60)
-        if forecast_dates is not None:
-            plot_future_forecast(df, forecast_dates, forecast_prices)
-
-        return recommendation
+        
+        # Machine Learning Pipeline
+        data = create_lagged_features(df, lags=5)
+        model, data, rmse, features = train_rf_model(data, lags=5)
+        
+        # Future Projection
+        forecast_dates, future_prices = project_future_prices(model, data, features, days_ahead=30)
+        
+        # Visualization & Output
+        plot_full_analysis(data, forecast_dates, future_prices, symbol)
+        rec = make_investment_decision(ratios, data, future_prices, rmse)
+        return rec
     else:
         return f"No valid data found for {symbol}"
 
-
 # -----------------------------
-# Execution Example
+# Run the Platform
 # -----------------------------
 stock_list = [
-    'ITC.NS',      # ITC Ltd
-    'TCS.NS',      # Tata Consultancy Services
-    'HDFCBANK.NS', # HDFC Bank
-    'INFY.NS',     # Infosys
-    'RELIANCE.NS', # Reliance Industries
-    'ICICIBANK.NS',# ICICI Bank
-    'HINDUNILVR.NS',# Hindustan Unilever
-    'KOTAKBANK.NS',# Kotak Mahindra Bank
-    'LT.NS',       # Larsen & Toubro
-    'SBIN.NS'      # State Bank of India
+    'ITC.NS',   # ITC Ltd
+    'TCS.NS'    # Tata Consultancy Services
 ]
 
 for symbol in stock_list:
