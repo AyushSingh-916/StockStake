@@ -21,6 +21,11 @@ def load_stock_data(symbol, years=2):
         start_date = end_date - datetime.timedelta(days=years*365)
         
         df = yf.download(symbol, start=start_date.strftime('%Y-%m-%d'), end=end_date.strftime('%Y-%m-%d'), progress=False)
+        
+        # FIX: Flatten MultiIndex columns introduced in recent yfinance updates
+        if isinstance(df.columns, pd.MultiIndex):
+            df.columns = df.columns.get_level_values(0)
+            
         stock_info = yf.Ticker(symbol)
         return df, stock_info
     except Exception as err:
@@ -33,7 +38,9 @@ def load_stock_data(symbol, years=2):
 def safe_extract(df, keys):
     if df is None or df.empty: return np.nan
     for key in keys:
-        if key in df.index: return df.loc[key].iloc 
+        if key in df.index: 
+            # FIX: Added to iloc to grab the most recent year's value
+            return df.loc[key].iloc 
     return np.nan
 
 def extract_financial_ratios(stock_info):
